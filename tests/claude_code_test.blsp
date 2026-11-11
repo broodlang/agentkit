@@ -1,0 +1,157 @@
+(defmodule claude-code-test
+  (:use test)
+  (:use agentkit/claude-code))
+
+(def fake (path/absolute "tests/fixtures/fake-claude"))
+
+(defn cct-events (worker acc)
+  "The kinds of every event `worker` reports until it exits, or goes quiet for a second
+(a session refused before its CLI started never exits)."
+  (receive
+    ([:agent ^worker kind _payload] (let (next (conj acc kind))
+                                      (if (= kind :exited) next (cct-events worker next))))
+    (after 1000 acc)))
+
+(defn cct-until (worker kind acc)
+  "The events `worker` reports up to and including the first `kind`."
+  (receive
+    ([:agent ^worker k payload] (let (next (conj acc [k payload]))
+                                  (if (= k kind) next (cct-until worker kind next))))
+    (after 5000 acc)))
+
+(describe "subscription only"
+  (test "the API-key variables are removed from the child's environment"
+    (let (env (subscription-env))
+      (is (every? api-variables (fn (name) (and (contains? env name) (nil? (get env name))))))
+      (assert= (get (subscription-env "/x") "CLAUDE_CONFIG_DIR") "/x")))
+  (test "only a claude.ai login is a subscription"
+    (is (nil? (subscription-problem {:loggedIn true
+                                     :authMethod "claude.ai"
+                                     :apiProvider "firstParty"})))
+    (is (string? (subscription-problem {:loggedIn false})))
+    (is (string? (subscription-problem {:loggedIn true :authMethod "api_key"})))
+    (is (string? (subscription-problem {:loggedIn true
+                                        :authMethod "claude.ai"
+                                        :apiProvider "bedrock"}))))
+  (test "an init event naming an API key is a problem"
+    (is (nil? (init-problem {:apiKeySource "none"})))
+    (is (string? (init-problem {:apiKeySource "apiKeyHelper"}))))
+  (test "a claude.ai login starts the session"
+    (do
+      (let (worker (start {:cwd "." :program fake} (self))
+            ;; as the real CLI, it says nothing until the first message
+            _ (send worker [:prompt "hi"])
+            events (cct-until worker :ready []))
+        (send worker [:stop])
+        (assert= (into [] (map events first)) [:ready])
+        (assert= (:auth (second (first events))) "none"))))
+  (test "a session with an API-key login is refused before the CLI starts"
+    (assert= (cct-events (start {:cwd "." :program (str fake "-api")} (self)) []) [:refused]))
+  (test "a session whose init says an API key is refused and closed"
+    (let (worker (start {:cwd "." :program (str fake "-helper")} (self)))
+      (send worker [:prompt "hi"])
+      ;; refused at its init: nothing of the turn reaches the subscriber
+      (assert= (cct-events worker []) [:refused :exited]))))
+
+(describe "a headless session"
+  (test "a prompt's turn arrives in the shared vocabulary"
+    (do
+      (let (worker (start {:cwd "." :program fake} (self)))
+        (send worker [:prompt "hi"])
+        (cct-until worker :ready [])
+        (let (turn (cct-until worker :turn-done []))
+          (send worker [:stop])
+          (assert= (into [] (map turn first)) [:text-delta :text :tool-use :turn-done])
+          ;; the two deltas of one read arrive as one
+          (assert= (second (first turn)) "echo")
+          (assert= (second (nth turn 2)) {:id "t1" :name "mcp__x__read" :input {:path "a"}})
+          (assert= (map/get-in (second (last turn)) [:context :tokens]) 5))))))
+
+(describe "command lines"
+  (test "headless args carry the tools, the MCP servers and the model"
+    (let (args (headless-args {:model "opus"
+                               :tools []
+                               :allowed-tools ["mcp__bedit"]
+                               :mcp-servers {"bedit" {:url "http://127.0.0.1:9/mcp" :token "t"}}}))
+      (is (includes? args "stream-json"))
+      (assert= (second (seq/drop-while args (fn (a) (not (= a "--tools"))))) "")
+      (assert= (second (seq/drop-while args (fn (a) (not (= a "--model"))))) "opus")
+      (is (includes? args "--strict-mcp-config"))))
+  (test "resume wins over a session id"
+    (let (args (headless-args {:resume "r" :session-id "s"}))
+      (is (includes? args "--resume"))
+      (is (not (includes? args "--session-id")))))
+  (test "the interactive command unsets every API variable"
+    (let (line (interactive-command {:model "sonnet"}))
+      (is (every? api-variables (fn (name) (includes? line (str "-u " name)))))
+      (is (includes? line "--model sonnet")))))
+
+(describe "decoding"
+  (test "a tool result and a failed turn"
+    (assert= (decode-event {:type "user"
+                            :message {:content [{:type "tool_result"
+                                                 :tool_use_id "t1"
+                                                 :content "ok"}]}})
+      [[:tool-result {:id "t1" :output "ok" :error? false}]])
+    (assert= (first (first (decode-event {:type "result" :subtype "error_max_turns"}))) :error))
+  (test "plan limits"
+    (assert= (decode-event {:type "rate_limit_event"
+                            :rate_limit_info {:unifiedWindows {:seven_day {:utilization 0.5
+                                                                           :resetsAt 9
+                                                                           :status "allowed"}}}})
+      [[:limits {"seven_day" {:used 0.5 :resets-at 9 :status "allowed"}}]])))
+
+(describe "the MCP config file"
+  (test "is written where only you can read it, and names the server"
+    (let (dir (path/join (or (test/scratch-dir) "/tmp") (str "mcp-" (rand/token 6)))
+          written (write-mcp-config {"bedit" {:url "http://127.0.0.1:9/mcp" :token "sekrit"}} dir)
+          file (if (failure? written) (error (error-message written)) written))
+      (assert= (map/get-in (json/decode (file/slurp file)) [:mcpServers :bedit :headers :X-Token])
+        "sekrit")
+      (assert= (:stdout (os/cmd "stat" ["-c" "%a" file])) "600\n")
+      (is (includes? (headless-args {:mcp-config-file file}) file)))))
+
+(describe "deltas"
+  (test "a run of deltas is joined, the rest kept in order"
+    (assert= (merge-deltas [[:text-delta "a"] [:text-delta "b"] [:tool-use {}] [:text-delta "c"]])
+      [[:text-delta "ab"] [:tool-use {}] [:text-delta "c"]])))
+
+(describe "the owner"
+  (test "a session ends when the process that owns it does"
+    (let (me (self)
+          owner (spawn (receive (:go nil)))
+          worker (start {:cwd "." :program fake :owner owner} me))
+      (send worker [:prompt "hi"])
+      (cct-until worker :ready [])
+      (exit owner :kill)
+      (assert= (last (cct-events worker [])) :exited))))
+
+(describe "a session's history"
+  (test "a logged session reads back as the shared vocabulary"
+    (let (home (path/join (or (test/scratch-dir) "/tmp") (str "claude-home-" (rand/token 6)))
+          dir (project-log-dir "/src/my.app" home))
+      (os/cmd "mkdir" ["-p" dir])
+      (file/spit (path/join dir "s-9.jsonl")
+        (string/join [(json/encode {:type "session-owner"})
+                       (json/encode {:type "user"
+                                     :message {:role "user"
+                                               :content [{:type "text" :text "fix it"}]}})
+                       (json/encode {:type "user"
+                                     :isMeta true
+                                     :message {:content "<system-reminder>x"}})
+                       (json/encode {:type "assistant"
+                                     :message {:content [{:type "text" :text "On it."}
+                                                          {:type "tool_use"
+                                                           :id "t1"
+                                                           :name "mcp__bedit__read"
+                                                           :input {:path "a"}}]}})
+                       (json/encode {:type "user"
+                                     :message {:content [{:type "tool_result"
+                                                          :tool_use_id "t1"
+                                                          :content "a's text"}]}})]
+          "\n"))
+      (let (read (history "/src/my.app" "s-9" home)
+            events (if (failure? read) (error (error-message read)) read))
+        (assert= (into [] (map events first)) [:prompt :text :tool-use :tool-result])
+        (assert= (second (first events)) "fix it"))
+      (is (failure? (history "/src/my.app" "nope" home))))))

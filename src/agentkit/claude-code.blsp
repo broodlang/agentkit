@@ -1,0 +1,425 @@
+;; The Claude Code backend: the `claude` CLI, signed in with the user's subscription.
+;;
+;; Design notes (the *why*; the *what* is in the docstrings):
+;;  - SUBSCRIPTION ONLY. The CLI prefers an API key to the subscription login whenever one is
+;;    in its environment (`ANTHROPIC_API_KEY`, an auth token, a Bedrock / Vertex / Foundry
+;;    switch) — and then every turn is billed per token. So the child never inherits those
+;;    variables (`subscription-env`), the login is checked before anything is sent
+;;    (`claude auth status` must say `claude.ai`), and the session's own `init` event is
+;;    checked again (`apiKeySource` must be `none`, which a settings file's `apiKeyHelper`
+;;    would change). A session that fails any of the three is refused, never run.
+;;  - Headless, the CLI speaks stream-json both ways: one user message per line in, one event
+;;    per line out. A session is ONE long-lived process; each prompt is a line, each turn ends
+;;    with a `result` event, and the process waits for the next line.
+;;  - The program that starts a session decides which tools it has. With `:tools []` the CLI
+;;    has none of its own, and every tool is the program's, served over MCP — the program
+;;    sees and answers every call.
+
+(defmodule agentkit/claude-code
+  "Run Claude Code on the user's subscription. `start` a headless session — a worker that
+speaks stream-json to the `claude` CLI and reports `agentkit/events` to its subscriber;
+send it `[:prompt text]`, `[:interrupt]` or `[:stop]`. `interactive-command` is the
+command line for the CLI's own terminal interface under the same rules. Every session,
+headless or not, runs with the API-key variables removed (`subscription-env`) and only
+after the login is a claude.ai one (`subscription-problem`)."
+  (:use agentkit/events))
+
+;; The variables that would make the CLI bill an API account instead of the subscription.
+(def api-variables
+  ["ANTHROPIC_API_KEY"
+    "ANTHROPIC_AUTH_TOKEN" "ANTHROPIC_BASE_URL" "CLAUDE_CODE_USE_BEDROCK" "CLAUDE_CODE_USE_VERTEX"
+    "CLAUDE_CODE_USE_FOUNDRY" "ANTHROPIC_BEDROCK_BASE_URL" "ANTHROPIC_VERTEX_BASE_URL"
+    "ANTHROPIC_VERTEX_PROJECT_ID" "AWS_BEARER_TOKEN_BEDROCK"])
+
+;; How the CLI is found; a test binds a stand-in.
+(defdyn agentkit/claude-code/*program* "claude")
+
+(defn subscription-env (&optional (config-dir nil))
+  "The environment changes every `claude` child runs with: each of [[api-variables]]
+removed (a nil value unsets it), and `CLAUDE_CONFIG_DIR` set when `config-dir` names
+another Claude account's directory.
+
+    (get (agentkit/claude-code/subscription-env) \"ANTHROPIC_API_KEY\")   ;=> nil
+    (contains? (agentkit/claude-code/subscription-env) \"ANTHROPIC_API_KEY\")   ;=> true"
+  (let (scrubbed (into {} (map api-variables (fn (name) [name nil]))))
+    (if (string? config-dir) (assoc scrubbed "CLAUDE_CONFIG_DIR" config-dir) scrubbed)))
+
+(defn subscription-problem (status)
+  "Why `status` — `claude auth status` decoded — is not a subscription login, or nil when
+it is: logged in, through claude.ai, to Anthropic itself.
+
+    (agentkit/claude-code/subscription-problem {:loggedIn true :authMethod \"claude.ai\" :apiProvider \"firstParty\"})   ;=> nil
+    (agentkit/claude-code/subscription-problem {:loggedIn true :authMethod \"api_key\"})   ;=> \"Claude Code is signed in with api_key, not a claude.ai subscription\""
+  (cond
+    (not (map? status)) "could not read `claude auth status`"
+    (not (:loggedIn status)) "Claude Code is not signed in (run `claude` and /login)"
+    (not (= (:authMethod status) "claude.ai"))
+      (str "Claude Code is signed in with " (:authMethod status) ", not a claude.ai subscription")
+    (and (:apiProvider status) (not (= (:apiProvider status) "firstParty")))
+      (str "Claude Code goes through " (:apiProvider status) ", not the subscription")
+    else nil))
+
+(defn auth-status (&optional (config-dir nil) (program nil) (cwd nil))
+  "`claude auth status` under [[subscription-env]], decoded — or a failure saying why it
+could not be read. Run in `cwd`, where the session will run: a project's own Claude settings
+can set the provider or an API key through their `env`, and only a check run there sees it.
+Blocks for the CLI's answer (well under a second; 20 s at most); call it off any loop that
+paints."
+  (let (result (try
+                 (os/cmd (or program agentkit/claude-code/*program*)
+                   ["auth" "status"]
+                   {:env (subscription-env config-dir) :cwd cwd :timeout-ms 20000})
+                 (catch e (failure "cannot run claude: " (error-message e)))))
+    (cond
+      (failure? result) result
+      (not (= (:exit result) 0))
+        (failure "claude auth status failed: "
+          (string/trim (str (:stdout result) (:stderr result))))
+      else
+        (try
+          (json/decode (:stdout result))
+          (catch e (failure "claude auth status answered no JSON: " (error-message e)))))))
+
+(defn init-problem (event)
+  "Why a session's `init` event shows it is not on the subscription, or nil: its
+`apiKeySource` must be `none`.
+
+    (agentkit/claude-code/init-problem {:type \"system\" :subtype \"init\" :apiKeySource \"none\"})   ;=> nil
+    (agentkit/claude-code/init-problem {:type \"system\" :subtype \"init\" :apiKeySource \"ANTHROPIC_API_KEY\"})   ;=> \"the session would bill an API key (ANTHROPIC_API_KEY), not the subscription\""
+  (let (source (:apiKeySource event))
+    (if (or (nil? source) (= source "none"))
+      nil
+      (str "the session would bill an API key (" source "), not the subscription"))))
+
+;; ---- the command lines --------------------------------------------------------------
+
+(defn mcp-config (servers)
+  "The `--mcp-config` JSON for `servers`, a map of name -> `{:url :token}` (an HTTP server
+reached with an `X-Token` header) or `{:command :args}` (a stdio one).
+
+    (map/get-in (json/decode (agentkit/claude-code/mcp-config {\"bedit\" {:url \"http://127.0.0.1:1/mcp\" :token \"t\"}})) [:mcpServers :bedit :type])   ;=> \"http\""
+  (json/encode {:mcpServers (into {}
+                              (map servers
+                                (fn ([name server])
+                                  [name
+                                    (if (:url server)
+                                      {:type "http"
+                                       :url (:url server)
+                                       :headers {"X-Token" (:token server)}}
+                                      {:command (:command server) :args (or (:args server) [])})])))}))
+
+(defn write-mcp-config (servers dir)
+  "Write the `--mcp-config` JSON for `servers` ([[mcp-config]]) to a file only you can read, in
+private directory `dir`, and answer its path — or a failure. What a session passes instead
+of the JSON itself: the JSON carries each server's token, and a command line is visible to
+every user of the machine (`ps`). Remove the file when the session ends."
+  (let (made (try (file/mkdir-private dir) (catch e (failure (error-message e))))
+        file (path/join dir (str "mcp-" (rand/token 8) ".json")))
+    (if (failure? made)
+      made
+      (let (written (try
+                      (file/spit file (mcp-config servers))
+                      (catch e (failure (error-message e)))))
+        (if (failure? written)
+          written
+          (let (private (file/chmod file 384)) (if (failure? private) private file)))))))
+
+(defn- option (flag value)
+  (if (or (nil? value) (= value "")) [] [flag (str value)]))
+
+(defn- shared-args (opts)
+  ;; what a headless and an interactive session both take from `opts`
+  (append (option "--model" (:model opts))
+    (option "--effort" (:effort opts))
+    (option "--permission-mode" (:permission-mode opts))
+    (option "--append-system-prompt" (:append-system-prompt opts))
+    (if (:resume opts) ["--resume" (:resume opts)] (option "--session-id" (:session-id opts)))
+    (mapcat (or (:add-dirs opts) []) (fn (dir) ["--add-dir" dir]))
+    (if (or (:mcp-config-file opts) (:mcp-servers opts))
+      (append ["--mcp-config" (or (:mcp-config-file opts) (mcp-config (:mcp-servers opts)))]
+        (if (:strict-mcp? opts true) ["--strict-mcp-config"] []))
+      [])
+    (if (nil? (:tools opts)) [] ["--tools" (string/join (:tools opts) ",")])
+    (if (empty? (or (:allowed-tools opts) []))
+      []
+      ["--allowedTools" (string/join (:allowed-tools opts) ",")])
+    (if (empty? (or (:disallowed-tools opts) []))
+      []
+      ["--disallowedTools" (string/join (:disallowed-tools opts) ",")])))
+
+(defn headless-args (opts)
+  "The argv for a headless (`-p`, stream-json both ways) session. `opts`: `:model`,
+`:effort`, `:permission-mode`, `:append-system-prompt`, `:session-id` or `:resume`,
+`:add-dirs`, `:mcp-config-file` (a file [[write-mcp-config]] wrote) or `:mcp-servers` (the
+JSON inline, see [[mcp-config]]; `:strict-mcp?` default true), `:tools`
+(the CLI's own tools — `[]` for none), `:allowed-tools`, `:disallowed-tools`. A tool call
+that would prompt is answered by nobody (`--permission-prompts none`): a program that
+wants a say in a call serves the tool itself.
+
+    (take (agentkit/claude-code/headless-args {:model \"opus\" :tools []}) 3)   ;=> (\"-p\" \"--verbose\" \"--input-format\")"
+  (append ["-p"
+            "--verbose" "--input-format" "stream-json" "--output-format" "stream-json"
+            "--include-partial-messages" "--permission-prompts" "none"]
+    (shared-args opts)))
+
+(defn interactive-command (opts)
+  "The shell command line for the CLI's own terminal interface with `opts` (as
+[[headless-args]] takes, plus `:config-dir`): the API-key variables unset in front of it,
+every word quoted — what a terminal buffer runs.
+
+    (string/starts-with? (agentkit/claude-code/interactive-command {}) \"env -u ANTHROPIC_API_KEY\")   ;=> true"
+  (let (unset (mapcat api-variables (fn (name) ["-u" name]))
+        config (if (:config-dir opts) [(str "CLAUDE_CONFIG_DIR=" (:config-dir opts))] [])
+        words (append ["env"]
+                unset
+                config
+                [(or (:program opts) agentkit/claude-code/*program*)]
+                (shared-args opts)))
+    (string/join (map words os/shell-quote) " ")))
+
+(defn user-line (text)
+  "One user message as a stream-json input line, newline-terminated.
+
+    (map/get-in (json/decode (agentkit/claude-code/user-line \"hi\")) [:message :role])   ;=> \"user\""
+  (str (json/encode {:type "user" :message {:role "user" :content [{:type "text" :text text}]}})
+    "\n"))
+
+(defn interrupt-line (id)
+  "The stream-json control request that interrupts the turn in flight, newline-terminated.
+
+    (includes? (agentkit/claude-code/interrupt-line \"i1\") \"interrupt\")   ;=> true"
+  (str (json/encode {:type "control_request" :request_id id :request {:subtype "interrupt"}}) "\n"))
+
+;; ---- the CLI's events, in the shared vocabulary --------------------------------------
+
+(defn- block-events (block)
+  ;; one content block of an assistant or user message
+  (case (:type block)
+    "text" (if (string/blank? (or (:text block) "")) [] [[:text (:text block)]])
+    "tool_use" [[:tool-use {:id (:id block) :name (:name block) :input (or (:input block) {})}]]
+    "tool_result"
+      [[:tool-result
+         {:id (:tool_use_id block)
+          :output (let (content (:content block))
+                    (if (string? content)
+                      content
+                      (string/join (map (if (vector? content) content [])
+                                     (fn (part) (or (:text part) "")))
+                        "\n")))
+          :error? (or (:is_error block) false)}]]
+    []))
+
+(defn- delta-events (event)
+  (if (= (:type event) "content_block_delta")
+    (let (delta (:delta event))
+      (case (:type delta)
+        "text_delta" [[:text-delta (:text delta)]]
+        "thinking_delta" [[:thinking (:thinking delta)]]
+        []))
+    []))
+
+(defn plan-limits (info)
+  "A `rate_limit_event`'s `rate_limit_info` as `{window {:used :resets-at :status}}`, `:used`
+a fraction.
+
+    (agentkit/claude-code/plan-limits {:unifiedWindows {:five_hour {:utilization 0.25 :resetsAt 10 :status \"allowed\"}}})   ;=> {\"five_hour\" {:used 0.25 :resets-at 10 :status \"allowed\"}}"
+  (into {}
+    (map (or (:unifiedWindows info) {})
+      (fn ([window state])
+        [(->string window)
+          {:used (:utilization state) :resets-at (:resetsAt state) :status (:status state)}]))))
+
+(defn- context-of (event)
+  ;; how full the context is after the turn's last request
+  (let (request (last (or (map/get-in event [:usage :iterations]) [])))
+    (if (map? request)
+      (let (cached (or (:cache_read_input_tokens request) 0)
+            prompt (+ (or (:input_tokens request) 0)
+                     cached
+                     (or (:cache_creation_input_tokens request) 0)))
+        {:prompt prompt :cached cached :tokens (+ prompt (or (:output_tokens request) 0))})
+      nil)))
+
+(defn decode-event (event)
+  "The `[[kind payload] …]` of the shared vocabulary for one decoded stream-json `event`.
+
+    (agentkit/claude-code/decode-event {:type \"stream_event\" :event {:type \"content_block_delta\" :delta {:type \"text_delta\" :text \"Hi\"}}})   ;=> [[:text-delta \"Hi\"]]"
+  (case (:type event)
+    "system"
+      (if (= (:subtype event) "init")
+        [[:ready
+           {:session (:session_id event)
+            :model (:model event)
+            :tools (or (:tools event) [])
+            :backend :claude-code
+            :auth (:apiKeySource event)}]]
+        [])
+    "stream_event" (delta-events (or (:event event) {}))
+    "assistant" (vec (mapcat (or (map/get-in event [:message :content]) []) block-events))
+    "user"
+      (vec (seq/filter (mapcat (or (map/get-in event [:message :content]) []) block-events)
+             (fn (pair) (= (first pair) :tool-result))))
+    "rate_limit_event" [[:limits (plan-limits (or (:rate_limit_info event) {}))]]
+    "result"
+      (if (and (= (or (:subtype event) "success") "success") (not (:is_error event)))
+        [[:turn-done
+           {:text (:result event)
+            :usage (:usage event)
+            :context (context-of event)
+            :api-value (:total_cost_usd event)
+            :session (:session_id event)
+            :stop (:stop_reason event)}]]
+        [[:error (or (:result event) (str "Claude Code stopped: " (:subtype event)))]])
+    []))
+
+;; ---- the session worker ---------------------------------------------------------------
+
+(defn- decode-line (line)
+  (check-allow :discarded-catch (try (json/decode line) (catch _ nil))))
+
+(defn merge-deltas (pairs)
+  "`pairs` (`[kind payload]`) with each run of `:text-delta`s joined into one: what streams in
+one read of the CLI's output reaches the subscriber as one event, so a front end pays for
+one edit where it would have paid for dozens.
+
+    (agentkit/claude-code/merge-deltas [[:text-delta \"a\"] [:text-delta \"b\"] [:text \"ab\"]])   ;=> [[:text-delta \"ab\"] [:text \"ab\"]]"
+  (fold pairs
+    []
+    (fn (merged pair)
+      (let (previous (last merged))
+        (if (and previous (= (first pair) :text-delta) (= (first previous) :text-delta))
+          (conj (into [] (seq/drop-last merged 1))
+            [:text-delta (str (second previous) (second pair))])
+          (conj merged pair))))))
+
+(defn- collect (state event subscriber)
+  ;; one CLI event's reports onto `:out` — unless the event shows the session is not on the
+  ;; subscription, which refuses it at once and collects nothing more
+  (let (problem (if (and (= (:type event) "system") (= (:subtype event) "init"))
+                  (init-problem event)
+                  nil))
+    (cond
+      (:refused state) state
+      problem (do (report subscriber :refused problem) (assoc state :refused true))
+      else (assoc state :out (into (or (:out state) []) (decode-event event))))))
+
+(defn- pump (process subscriber buffer state)
+  ;; read the CLI's events and the owner's requests until the process ends; the process
+  ;; that owns the session going (`:owner`) ends it too
+  (let (owner (:owner-ref state))
+    (receive
+      ([:down ^owner _ _] (os/close process) (pump-rest process subscriber))
+      ([:proc ^process data] (let (parts (string/split (str buffer data) "\n")
+                                   events (seq/filter (map (seq/drop-last parts 1) decode-line)
+                                            map?)
+                                   collected (fold events
+                                               state
+                                               (fn (state event) (collect state event subscriber)))
+                                   next (dissoc collected :out))
+                               (doseq (pair (merge-deltas (or (:out collected) [])))
+                                 (report subscriber (first pair) (second pair)))
+                               (if (:refused next)
+                                 (do (os/close process) (pump-rest process subscriber))
+                                 (pump process subscriber (last parts) next))))
+      ([:proc-err ^process data] (pump process
+                                   subscriber
+                                   buffer
+                                   (assoc state :stderr (str (or (:stderr state) "") data))))
+      ([:proc-exit ^process _] (pump process subscriber buffer state))
+      ([:proc-closed ^process code] (when (and (not (= code 0)) (not (nil? code)) (:stderr state))
+                                      (report subscriber :error (string/trim (str (:stderr state)))))
+        (report subscriber :exited {:code code}))
+      ([:prompt text] (os/write process (user-line text))
+        (pump process subscriber buffer state))
+      ([:interrupt] (os/write process (interrupt-line (str "interrupt-" (os/now))))
+        (pump process subscriber buffer state))
+      ([:stop] (os/close process) (pump process subscriber buffer state)))))
+
+(defn- pump-rest (process subscriber)
+  (receive
+    ([:proc-closed ^process code] (report subscriber :exited {:code code}))
+    ([:proc-exit ^process _] (pump-rest process subscriber))
+    ([:proc ^process _] (pump-rest process subscriber))
+    ([:proc-err ^process _] (pump-rest process subscriber))))
+
+(defn start (opts subscriber)
+  "Start a headless Claude Code session in a worker and answer its pid. `opts` is what
+[[headless-args]] takes, plus `:cwd` (where the CLI runs), `:config-dir` (another account's
+Claude directory), `:program` (the CLI, default `*program*`), `:owner` (a process whose end
+ends the session: an editor loop that restarts leaves no CLI behind) and `:check-auth?`
+(default true). The worker checks the login first and
+reports `:refused` without starting the CLI when it is not a subscription one; otherwise
+it reports every event of the session (`agentkit/events`) to `subscriber` until the CLI
+exits. Send the worker `[:prompt text]` to ask, `[:interrupt]` to stop the turn in flight,
+`[:stop]` to end the session."
+  (let (program (or (:program opts) agentkit/claude-code/*program*))
+    (spawn (let (problem (if (:check-auth? opts true)
+                           (let (status (auth-status (:config-dir opts) program (:cwd opts)))
+                             (if (failure? status)
+                               (error-message status)
+                               (subscription-problem status)))
+                           nil))
+             (if problem
+               (report subscriber :refused problem)
+               (let (process (try
+                               (os/spawn program
+                                 (headless-args opts)
+                                 {:cwd (:cwd opts) :env (subscription-env (:config-dir opts))})
+                               (catch e (failure (error-message e)))))
+                 (if (failure? process)
+                   (report subscriber
+                     :refused (str "cannot start claude: " (error-message process)))
+                   (pump process
+                     subscriber
+                     ""
+                     {:owner-ref (if (:owner opts) (monitor (:owner opts)) nil)}))))))))
+
+;; ---- a session's history ---------------------------------------------------------------------
+;; Claude Code keeps each session as a JSON-lines log, `<config-dir>/projects/<cwd>/<id>.jsonl`,
+;; the working directory spelled with `/` and `.` as `-`. Read back, it is the conversation in
+;; the shared vocabulary: what a resumed session shows before it goes on.
+
+(defn project-log-dir (cwd &optional (config-dir nil))
+  "Where Claude Code keeps the session logs of working directory `cwd`, for the account in
+`config-dir` — by default the one the CLI would use: `CLAUDE_CONFIG_DIR`, else `~/.claude`.
+
+    (agentkit/claude-code/project-log-dir \"/src/my.app\" \"/c\")   ;=> \"/c/projects/-src-my-app\""
+  (path/join (or config-dir
+               (let (inherited (os/env "CLAUDE_CONFIG_DIR"))
+                 (if (string/blank? (or inherited "")) nil inherited))
+               (path/join (or (path/home) "/") ".claude"))
+    "projects"
+    (regex/replace "[/.]" cwd "-")))
+
+(defn- prompt-text (content)
+  ;; what the person typed in a logged user message, or nil for a tool's answer
+  (cond
+    (string? content) content
+    (vector? content)
+      (let (texts (seq/keep content (fn (part) (if (= (:type part) "text") (:text part) nil))))
+        (if (empty? texts) nil (string/join texts "\n")))
+    else nil))
+
+(defn- logged-events (entry)
+  (case (:type entry)
+    "assistant" (vec (mapcat (or (map/get-in entry [:message :content]) []) block-events))
+    "user"
+      (let (content (map/get-in entry [:message :content])
+            text (if (:isMeta entry) nil (prompt-text content)))
+        (if (and text (not (string/starts-with? (string/trim text) "<")))
+          [[:prompt text]]
+          (vec (seq/filter (mapcat (if (vector? content) content []) block-events)
+                 (fn (pair) (= (first pair) :tool-result))))))
+    []))
+
+(defn history (cwd session-id &optional (config-dir nil))
+  "Session `session-id`'s conversation in `cwd`, read from Claude Code's log, as `[[kind
+payload] …]` of the shared vocabulary — `:prompt`, `:text`, `:tool-use`, `:tool-result` — or a
+failure saying why it could not be read."
+  (let (file (path/join (project-log-dir cwd config-dir) (str session-id ".jsonl")))
+    (if (not (file/exists? file))
+      (failure "no log for session " session-id " (" file ")")
+      (let (text (try (file/slurp file) (catch e (failure (error-message e)))))
+        (if (failure? text)
+          text
+          (vec (mapcat (seq/filter (map (string/split text "\n") decode-line) map?) logged-events)))))))

@@ -1,0 +1,44 @@
+(defmodule agentkit/events
+  "The ONE vocabulary every agent backend reports in, so whatever shows a conversation —
+an editor's chat buffer, a terminal app — folds one set of events whichever model runs it.
+
+A backend's worker sends its subscriber `[:agent worker kind payload]`, `worker` the pid of
+the worker that sent it. The kinds:
+
+- `:ready` — the session is up: `{:session :model :tools :backend :auth}`
+- `:prompt` — a message the person sent (a resumed session's history replays them; a live one
+  never reports what its own front end sent)
+- `:text-delta` — a piece of the reply as it streams (a string)
+- `:text` — one whole text block of the reply, once it is complete (a string)
+- `:thinking` — a piece of the model's reasoning, when the backend shows it (a string)
+- `:tool-use` — the model called a tool: `{:id :name :input}`
+- `:tool-result` — that call's answer as the model saw it: `{:id :output :error?}`
+- `:turn-done` — the turn ended: `{:text :usage :context :api-value :session :stop}`
+- `:limits` — how much of a plan's windows is used: `{window {:used :resets-at :status}}`
+- `:error` — the turn failed; the session may go on (a string)
+- `:refused` — the session was not started, and why (a string): the subscription check
+- `:exited` — the backend's process ended: `{:code}`")
+
+(defn report (subscriber kind payload)
+  "Send `subscriber` one event of this vocabulary from the calling worker:
+`[:agent (self) kind payload]`. Answers the message sent.
+
+    (agentkit/events/report (self) :text \"hi\")   ;~> [:agent #<pid …> :text \"hi\"]"
+  (let (message [:agent (self) kind payload])
+    (send subscriber message)
+    message))
+
+(def kinds
+  #{:ready
+    :prompt :text-delta :text :thinking :tool-use :tool-result :turn-done :limits :error :refused
+    :exited})
+
+(defn event? (message)
+  "Whether `message` is an event of this vocabulary.
+
+    (agentkit/events/event? [:agent (self) :text \"hi\"])   ;=> true
+    (agentkit/events/event? [:agent (self) :bogus 1])   ;=> false"
+  (and (vector? message)
+    (= (count message) 4)
+    (= (first message) :agent)
+    (contains? kinds (nth message 2))))

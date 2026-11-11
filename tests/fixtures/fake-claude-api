@@ -1,0 +1,2 @@
+#!/bin/sh
+FAKE_AUTH=api exec "$(dirname "$0")/fake-claude" "$@"

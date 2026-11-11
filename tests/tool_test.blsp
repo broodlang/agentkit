@@ -1,0 +1,24 @@
+(defmodule tool-test
+  (:use test)
+  (:use agentkit/tool))
+
+(def tt-add
+  {:name "add"
+   :description "Add x and y."
+   :schema {:type "object"}
+   :risk :read
+   :handler (fn (arguments) (+ (:x arguments) (:y arguments)))})
+
+(describe "tools"
+  (test "a handler's answer becomes a result"
+    (assert= (run-tool tt-add {:x 1 :y 2}) {:ok? true :output "3" :summary "3"})
+    (assert= (:ok? (run-tool tt-add {:x "a" :y 2})) false))
+  (test "a function definition for an API model"
+    (assert= (map/get-in (->function-definition tt-add) [:function :name]) "add"))
+  (test "an MCP entry answers text, or an error map MCP flags"
+    (let (entry (->mcp-entry tt-add))
+      (assert= ((:handler entry) {:x 2 :y 2}) "4")
+      (is (map? ((:handler entry) {:x "a"})))))
+  (test "a wrap decides in place of the plain call"
+    (let (denied (->mcp-entry tt-add (fn (_tool _arguments) (failed "denied by the user"))))
+      (assert= ((:handler denied) {:x 1 :y 1}) {"error" "Error: denied by the user"}))))

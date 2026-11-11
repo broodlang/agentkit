@@ -1,0 +1,2 @@
+#!/bin/sh
+FAKE_SOURCE=apiKeyHelper exec "$(dirname "$0")/fake-claude" "$@"

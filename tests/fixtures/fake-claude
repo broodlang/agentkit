@@ -1,0 +1,23 @@
+#!/bin/sh
+# A stand-in for the claude CLI. `auth status` answers per FAKE_AUTH. A session behaves as the
+# real one: nothing until the first user message, then the init event, then each turn.
+if [ "$1" = "auth" ]; then
+  case "$FAKE_AUTH" in
+    api) echo '{"loggedIn":true,"authMethod":"api_key"}' ;;
+    *) echo '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty"}' ;;
+  esac
+  exit 0
+fi
+[ -n "$ANTHROPIC_API_KEY" ] && source="ANTHROPIC_API_KEY" || source="none"
+[ -n "$FAKE_SOURCE" ] && source="$FAKE_SOURCE"
+started=""
+while read -r line; do
+  if [ -z "$started" ]; then
+    echo '{"type":"system","subtype":"init","session_id":"s-1","model":"fake","tools":[],"apiKeySource":"'"$source"'"}'
+    started=yes
+  fi
+  echo '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"ec"}}}'
+  echo '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"ho"}}}'
+  echo '{"type":"assistant","message":{"content":[{"type":"text","text":"echo"},{"type":"tool_use","id":"t1","name":"mcp__x__read","input":{"path":"a"}}]}}'
+  echo '{"type":"result","subtype":"success","result":"echo","session_id":"s-1","usage":{"iterations":[{"input_tokens":3,"output_tokens":2}]}}'
+done

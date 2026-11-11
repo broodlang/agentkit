@@ -1,0 +1,84 @@
+(defmodule agentkit/tool
+  "Tools as data, whichever way a model reaches them. A TOOL is a map:
+
+- `:name` — what the model calls it (`read_buffer`)
+- `:description` — what the model reads to decide when to call it
+- `:schema` — its arguments as JSON Schema (a Brood map)
+- `:handler` — `(fn (arguments) -> result)`, arguments a keyword-keyed map
+- `:risk` — `:read` (only looks), `:edit` (changes files or buffers) or `:run` (runs a
+  program); what a permission policy decides on
+
+A RESULT is `{:ok? :output :summary}`: `:output` is what the model reads, `:summary` the
+short line a person sees. One tool serves both kinds of backend: a CLI agent reaches it over
+MCP ([[->mcp-entry]], an `mcp-server` catalogue entry) and an API model is offered it as a
+function definition ([[->function-definition]]).")
+
+(defn succeeded (output &optional (summary nil))
+  "A tool's successful result: `output` for the model, `summary` (default: its first line)
+for a person.
+
+    (agentkit/tool/succeeded \"3 files\")   ;=> {:ok? true :output \"3 files\" :summary \"3 files\"}"
+  {:ok? true
+   :output output
+   :summary (or summary (first (string/split (str output) "\n")))})
+
+(defn failed (message)
+  "A tool's failed result: the model reads `Error: message`, a person `message`.
+
+    (agentkit/tool/failed \"no such buffer\")   ;=> {:ok? false :output \"Error: no such buffer\" :summary \"no such buffer\"}"
+  {:ok? false :output (str "Error: " message) :summary message})
+
+(defn result? (value)
+  "Whether `value` is a tool result.
+
+    (agentkit/tool/result? (agentkit/tool/succeeded \"x\"))   ;=> true"
+  (and (map? value) (contains? value :ok?) (contains? value :output)))
+
+(defn as-result (value)
+  "Whatever a handler answered, as a result: a result as it is, a failure value as a
+failed result, anything else a success with its printed form.
+
+    (agentkit/tool/as-result 42)   ;=> {:ok? true :output \"42\" :summary \"42\"}"
+  (cond
+    (result? value) value
+    (failure? value) (failed (error-message value))
+    (string? value) (succeeded value)
+    else (succeeded (pr-str value))))
+
+(defn run-tool (tool arguments)
+  "Run `tool`'s handler on `arguments` and answer its result; a handler that raises is a
+failed result naming the error, never a raise.
+
+    (agentkit/tool/run-tool {:name \"t\" :handler (fn (a) (+ (:x a) 1))} {:x 1})   ;=> {:ok? true :output \"2\" :summary \"2\"}"
+  (try
+    (as-result ((:handler tool) arguments))
+    (catch e (failed (str (:name tool) ": " (error-message e))))))
+
+(defn ->function-definition (tool)
+  "`tool` as an OpenAI-style function definition, what an API model is offered.
+
+    (agentkit/tool/->function-definition {:name \"t\" :description \"T.\" :schema {:type \"object\"}})   ;=> {:type \"function\" :function {:name \"t\" :description \"T.\" :parameters {:type \"object\"}}}"
+  {:type "function"
+   :function {:name (:name tool)
+              :description (or (:description tool) "")
+              :parameters (:schema tool)}})
+
+(defn ->mcp-entry (tool &optional (wrap nil))
+  "`tool` as an `mcp-server` catalogue entry. Its handler answers the result's output as
+text, or `{\"error\" output}` — which MCP reports as `isError` — for a failed one. `wrap`,
+when given, is `(fn (tool arguments) -> result)` run in place of the plain call: where an
+application puts its permission check and its feedback.
+
+    (:name (agentkit/tool/->mcp-entry {:name \"t\" :schema {:type \"object\"}}))   ;=> \"t\""
+  {:name (:name tool)
+   :description (or (:description tool) "")
+   :schema (:schema tool)
+   :handler (fn (arguments)
+              (let (result (if wrap (wrap tool arguments) (run-tool tool arguments)))
+                (if (:ok? result) (:output result) {"error" (:output result)})))})
+
+(defn named (tools name)
+  "The tool called `name` in `tools`, or nil.
+
+    (:name (agentkit/tool/named [{:name \"a\"} {:name \"b\"}] \"b\"))   ;=> \"b\""
+  (seq/find tools (fn (tool) (= (:name tool) name))))

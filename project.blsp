@@ -1,0 +1,13 @@
+;; agentkit — what a program needs to work with a coding agent, whichever model runs it:
+;; one event vocabulary every backend reports in, tools as data (served over MCP or offered
+;; as function definitions), and the Claude Code backend, which runs the `claude` CLI on the
+;; user's SUBSCRIPTION and never on an API key. Shared by bedit-agent and anything else that
+;; drives an agent; it knows nothing of either.
+(project
+  :name "agentkit"
+  :version "0.1.0"
+  :brood ">= 0.50.0"
+  :description
+    "Coding-agent plumbing for Brood programs: one event vocabulary for every backend, tools as data (MCP or function definitions), and a Claude Code backend that runs the claude CLI on the user's subscription only."
+  :repository "https://github.com/broodlang/agentkit"
+  :source-paths ["src"])
