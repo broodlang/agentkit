@@ -389,7 +389,7 @@ exits. Send the worker `[:prompt text]` to ask, `[:interrupt]` to stop the turn 
                  (if (string/blank? (or inherited "")) nil inherited))
                (path/join (or (path/home) "/") ".claude"))
     "projects"
-    (regex/replace "[/.]" cwd "-")))
+    (regex/replace cwd "[/.]" "-")))
 
 (defn- prompt-text (content)
   ;; what the person typed in a logged user message, or nil for a tool's answer
