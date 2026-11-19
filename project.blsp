@@ -5,7 +5,7 @@
 ;; drives an agent; it knows nothing of either.
 (project
   :name "agentkit"
-  :version "0.1.1"
+  :version "0.1.2"
   :brood ">= 0.56.0"
   :description
     "Coding-agent plumbing for Brood programs: one event vocabulary for every backend, tools as data (MCP or function definitions), and a Claude Code backend that runs the claude CLI on the user's subscription only."
