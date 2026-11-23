@@ -31,9 +31,10 @@ nothing of any editor; [bedit-agent](../bedit-agent) is its first user, and zubr
   logs that changed lately with what each is about and whether it is mid-turn, read from the
   tail alone; `read-new` reads what a log gained since a cursor as the shared vocabulary
   (brood's `file/slurp-bytes-from`, a half-written line held back); `follow` is a process that
-  sends it every half second as `[:agent-log follower {:events :reset?}]`. A subagent's lines
-  are left out. Needs a brood with `file/slurp-bytes-from` (ADR-780).
+  sends it as `[:agent-log follower {:events :reset?}]` as soon as the OS reports the log changed
+  (brood's `file/watch`), with a slow look as a backstop. A subagent's lines are left out. Needs
+  brood 0.58 (`file/slurp-bytes-from`, ADR-781; `file/watch`, ADR-782).
 
 ```bash
-nest test   # 28 tests against a stand-in CLI (tests/fixtures/fake-claude); no turn is spent
+nest test   # 29 tests against a stand-in CLI (tests/fixtures/fake-claude); no turn is spent
 ```

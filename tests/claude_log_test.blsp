@@ -124,4 +124,19 @@
             (assert= (into [] (map (:events read) first))
               [:text :turn-done]))
           (after 5000 (error "no second read")))
+        (send follower [:stop]))))
+
+  (test "an append is read as soon as the OS reports it, not at the next look"
+    (let (file (clt-log (clt-home) "-src-app" "s-5"))
+      (file/spit file (clt-line clt-prompt))
+      ;; the fallback look is a minute away: only the watch can bring the append in time
+      (let (follower (follow file (self) {:interval 60000}))
+        (receive
+          ([:agent-log ^follower _] :first)
+          (after 5000 (error "no first read")))
+        (file/spit-append file (clt-line clt-done))
+        (receive
+          ([:agent-log ^follower read]
+            (assert= (into [] (map (:events read) first)) [:text :turn-done]))
+          (after 3000 (error "the append was not read when the OS reported it")))
         (send follower [:stop])))))

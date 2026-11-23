@@ -199,20 +199,33 @@ and `:reset?` says so. A missing log reads nothing."
 
 ;; ---- following a log ---------------------------------------------------------------------------
 
-(defn- follow-loop (at subscriber subscriber-ref interval)
-  (let (read (read-new at))
+;; How often a follower whose log is watched (`file/watch`) looks anyway: a change the OS did not
+;; report — a network filesystem, a dropped event — is read this late, never lost.
+(def watched-interval 5000)
+
+(defn- follow-loop (at subscriber subscriber-ref interval watch)
+  (let (read (read-new at)
+        next (fn () (follow-loop (:cursor read) subscriber subscriber-ref interval watch)))
     (when (or (not (empty? (:events read))) (:reset? read))
       (send subscriber [:agent-log (self) {:events (:events read) :reset? (:reset? read)}]))
     (receive
-      ([:down ^subscriber-ref _ _] :done)
-      ([:stop] :done)
-      (after interval (follow-loop (:cursor read) subscriber subscriber-ref interval)))))
+      ([:down ^subscriber-ref _ _] (when watch (file/unwatch watch)) :done)
+      ([:stop] (when watch (file/unwatch watch)) :done)
+      ([:file-watch ^watch _ _] (next))
+      (after (if watch watched-interval interval) (next)))))
 
 (defn follow (file subscriber &optional (opts {}))
   "Start a process that follows the session log at `file` for `subscriber` and answer its pid:
 everything already in the log first (from `:offset`, default 0), then whatever is appended,
-each read sent as `[:agent-log follower {:events :reset?}]` (see `read-new`). It looks every
-`:interval` ms (default 500) and stops when sent `[:stop]` or when `subscriber` exits."
+each read sent as `[:agent-log follower {:events :reset?}]` (see `read-new`). It reads as soon as
+the OS says the log changed (brood's `file/watch`), and every [[watched-interval]] ms anyway;
+where the log cannot be watched it looks every `:interval` ms (default 500). It stops when sent
+`[:stop]` or when `subscriber` exits."
   (let (interval (or (:interval opts) 500)
         offset (or (:offset opts) 0))
-    (spawn (follow-loop (cursor file offset) subscriber (monitor subscriber) interval))))
+    (spawn (let (watch (file/watch file))
+             (follow-loop (cursor file offset)
+               subscriber
+               (monitor subscriber)
+               interval
+               (if (failure? watch) nil watch))))))
