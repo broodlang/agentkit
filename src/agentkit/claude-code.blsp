@@ -309,25 +309,28 @@ one edit where it would have paid for dozens.
   (let (owner (:owner-ref state))
     (receive
       ([:down ^owner _ _] (os/close process) (pump-rest process subscriber))
-      ([:proc ^process data] (let (parts (string/split (str buffer data) "\n")
-                                   events (seq/filter (map (seq/drop-last parts 1) decode-line)
-                                            map?)
-                                   collected (fold events
-                                               state
-                                               (fn (state event) (collect state event subscriber)))
-                                   next (dissoc collected :out))
-                               (doseq (pair (merge-deltas (or (:out collected) [])))
-                                 (report subscriber (first pair) (second pair)))
-                               (if (:refused next)
-                                 (do (os/close process) (pump-rest process subscriber))
-                                 (pump process subscriber (last parts) next))))
-      ([:proc-err ^process data] (pump process
-                                   subscriber
-                                   buffer
-                                   (assoc state :stderr (str (or (:stderr state) "") data))))
+      ([:proc ^process data]
+        (let (parts (string/split (str buffer data) "\n")
+              events (seq/filter (map (seq/drop-last parts 1) decode-line)
+                       map?)
+              collected (fold events
+                          state
+                          (fn (state event) (collect state event subscriber)))
+              next (dissoc collected :out))
+          (doseq (pair (merge-deltas (or (:out collected) [])))
+            (report subscriber (first pair) (second pair)))
+          (if (:refused next)
+            (do (os/close process) (pump-rest process subscriber))
+            (pump process subscriber (last parts) next))))
+      ([:proc-err ^process data]
+        (pump process
+          subscriber
+          buffer
+          (assoc state :stderr (str (or (:stderr state) "") data))))
       ([:proc-exit ^process _] (pump process subscriber buffer state))
-      ([:proc-closed ^process code] (when (and (not (= code 0)) (not (nil? code)) (:stderr state))
-                                      (report subscriber :error (string/trim (str (:stderr state)))))
+      ([:proc-closed ^process code]
+        (when (and (not (= code 0)) (not (nil? code)) (:stderr state))
+          (report subscriber :error (string/trim (str (:stderr state)))))
         (report subscriber :exited {:code code}))
       ([:prompt text] (os/write process (user-line text))
         (pump process subscriber buffer state))
@@ -400,7 +403,12 @@ exits. Send the worker `[:prompt text]` to ask, `[:interrupt]` to stop the turn 
         (if (empty? texts) nil (string/join texts "\n")))
     else nil))
 
-(defn- logged-events (entry)
+(defn entry-events (entry)
+  "The events of the shared vocabulary one decoded line of a session log holds: a person's prompt
+as `:prompt`, the model's text and tool calls, the tools' answers. A meta message (a reminder
+the CLI added) and a line of the log's own bookkeeping hold none.
+
+    (agentkit/claude-code/entry-events {:type \"user\" :message {:content \"fix it\"}})   ;=> [[:prompt \"fix it\"]]"
   (case (:type entry)
     "assistant" (vec (mapcat (or (map/get-in entry [:message :content]) []) block-events))
     "user"
@@ -422,4 +430,4 @@ failure saying why it could not be read."
       (let (text (try (file/slurp file) (catch e (failure (error-message e)))))
         (if (failure? text)
           text
-          (vec (mapcat (seq/filter (map (string/split text "\n") decode-line) map?) logged-events)))))))
+          (vec (mapcat (seq/filter (map (string/split text "\n") decode-line) map?) entry-events)))))))

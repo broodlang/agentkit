@@ -1,0 +1,127 @@
+(defmodule claude-log-test
+  (:use test)
+  (:use agentkit/claude-log))
+
+(defn clt-home ()
+  "A fresh directory standing for an account's Claude directory."
+  (let (home (path/join (or (test/scratch-dir) "/tmp") (str "claude-log-" (rand/token 6))))
+    (os/cmd "mkdir" ["-p" home])
+    home))
+
+(defn clt-log (home project id)
+  "The path of session `id`'s log under `home`, its project directory made."
+  (let (dir (path/join home "projects" project))
+    (os/cmd "mkdir" ["-p" dir])
+    (path/join dir (str id ".jsonl"))))
+
+(defn clt-line (entry) (str (json/encode entry) "\n"))
+
+(def clt-prompt
+  {:parentUuid nil
+   :isSidechain false
+   :type "user"
+   :cwd "/src/app"
+   :message {:role "user" :content [{:type "text" :text "fix the tests"}]}})
+
+(def clt-call
+  {:parentUuid "p1"
+   :isSidechain false
+   :type "assistant"
+   :cwd "/src/app"
+   :message {:stop_reason "tool_use"
+             :content [{:type "tool_use" :id "t1" :name "Edit" :input {:file_path "/src/app/a.txt"}}]}})
+
+(def clt-done
+  {:parentUuid "p2"
+   :isSidechain false
+   :type "assistant"
+   :cwd "/src/app"
+   :message {:stop_reason "end_turn" :content [{:type "text" :text "Done."}]}})
+
+(describe "reading what a session log gained"
+  (test "a follower reads each line once, and holds back a half-written one"
+    (let (file (clt-log (clt-home) "-src-app" "s-1"))
+      (file/spit file (str (clt-line clt-prompt) (clt-line clt-call)))
+      (let (first-read (read-new (cursor file)))
+        (assert= (into [] (map (:events first-read) first)) [:prompt :tool-use])
+        (assert= (:offset (:cursor first-read)) (file/size file))
+        ;; half of the next line arrives: nothing yet
+        (let (line (string/->bytes (clt-line clt-done))
+              half (math/quot (count line) 2))
+          (file/spit-bytes-append file (bytes/slice line 0 half))
+          (let (second-read (read-new (:cursor first-read)))
+            (assert= (:events second-read) [])
+            (assert= (:cursor second-read) (:cursor first-read))
+            ;; the rest arrives: the whole line, once
+            (file/spit-bytes-append file (bytes/slice line half (count line)))
+            (assert= (into [] (map (:events (read-new (:cursor second-read))) first))
+              [:text :turn-done]))))))
+
+  (test "a log shorter than the cursor was replaced, and is read again from its start"
+    (let (file (clt-log (clt-home) "-src-app" "s-2"))
+      (file/spit file (str (clt-line clt-prompt) (clt-line clt-call)))
+      (let (read (read-new (cursor file)))
+        (file/spit file (clt-line clt-prompt))
+        (let (again (read-new (:cursor read)))
+          (is (:reset? again))
+          (assert= (into [] (map (:events again) first)) [:prompt])))))
+
+  (test "a missing log reads nothing"
+    (let (at (cursor (path/join (clt-home) "none.jsonl")))
+      (assert= (read-new at) {:events [] :cursor at :reset? false})))
+
+  (test "a subagent's lines are left out"
+    (assert= (line-events (assoc clt-call :isSidechain true)) [])))
+
+(describe "finding the sessions on this machine"
+  (test "every recent log, newest first, with what its tail says"
+    (let (home (clt-home)
+          older (clt-log home "-src-app" "s-old")
+          newer (clt-log home "-src-app" "s-new"))
+      (file/spit older
+        (str (clt-line clt-prompt)
+          (clt-line {:type "ai-title" :aiTitle "Fix the tests" :sessionId "s-old"})
+          (clt-line clt-done)))
+      (file/spit newer
+        (str (clt-line clt-prompt)
+          (clt-line {:type "last-prompt" :lastPrompt "fix the tests" :sessionId "s-new"})
+          (clt-line clt-call)))
+      (file/set-mtime older (- (os/now) 60000))
+      (let (found (sessions {:config-dirs [home]}))
+        (assert= (into [] (map found :id)) ["s-new" "s-old"])
+        (let (newest (first found)
+              oldest (second found))
+          (assert= (:cwd newest) "/src/app")
+          (assert= (:title newest) "fix the tests")
+          (is (:working? newest))
+          (assert= (:title oldest) "Fix the tests")
+          (is (not (:working? oldest)))))))
+
+  (test "a log older than :within is not listed"
+    (let (home (clt-home)
+          file (clt-log home "-src-app" "s-3"))
+      (file/spit file (clt-line clt-prompt))
+      (file/set-mtime file (- (os/now) (* 2 60 60 1000)))
+      (assert= (sessions {:config-dirs [home] :within (* 60 60 1000)}) [])))
+
+  (test "an account directory counts only while it keeps logs"
+    (let (home (clt-home))
+      (os/cmd "mkdir" ["-p" (path/join home ".claude" "projects") (path/join home ".claude-work")])
+      (assert= (vec (seq/filter (config-dirs home) (fn (dir) (string/starts-with? dir home))))
+        [(path/join home ".claude")]))))
+
+(describe "following a log"
+  (test "the follower sends what is in the log, then what is appended"
+    (let (file (clt-log (clt-home) "-src-app" "s-4"))
+      (file/spit file (clt-line clt-prompt))
+      (let (follower (follow file (self) {:interval 20}))
+        (receive
+          ([:agent-log ^follower read] (assert= (into [] (map (:events read) first)) [:prompt]))
+          (after 5000 (error "no first read")))
+        (file/spit-append file (clt-line clt-done))
+        (receive
+          ([:agent-log ^follower read]
+            (assert= (into [] (map (:events read) first))
+              [:text :turn-done]))
+          (after 5000 (error "no second read")))
+        (send follower [:stop])))))

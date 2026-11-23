@@ -1,0 +1,218 @@
+;; FOLLOWING Claude Code from outside it. The CLI keeps each session as a JSON-lines log,
+;; `<config-dir>/projects/<cwd>/<id>.jsonl`, and writes every message to it as it happens: a
+;; tool call is logged when the model makes it, before the tool runs. So any program can see
+;; every session on the machine — one started in a terminal, in an editor, under any account —
+;; by reading those logs, with nothing set up in the sessions themselves.
+;;
+;; `sessions` finds the logs that changed lately and says what each is about, from the tail of
+;; the log alone. `read-new` reads what one log gained since a cursor, as the shared vocabulary
+;; (`agentkit/events`), holding back a half-written last line. `follow` is a process that does
+;; that every half second and sends what it read.
+
+(defmodule agentkit/claude-log
+  "Claude Code sessions run anywhere on this machine, found and followed through the logs the
+CLI keeps: `sessions` lists those that changed lately under every account, `read-new` reads
+what a log gained since a cursor, and `follow` sends it to a subscriber as it comes."
+  (:use agentkit/claude-code :only [entry-events]))
+
+;; ---- where the logs are -----------------------------------------------------------------------
+
+(defn- keeps-logs? (dir)
+  (and (string? dir) (not (string/blank? dir)) (file/dir? (path/join dir "projects"))))
+
+(defn config-dirs (&optional (home nil))
+  "Every Claude Code account directory under `home` (default the user's) that keeps session
+logs: `CLAUDE_CONFIG_DIR`, `~/.claude`, and each other `~/.claude*` directory (a second account
+kept beside the first)."
+  (let (home (or home (path/home) "/")
+        found (seq/filter (map (or (file/ls home) []) (fn (name) (path/join home name)))
+                (fn (dir) (string/starts-with? (path/basename dir) ".claude"))))
+    (vec (seq/distinct (seq/filter (cons (os/env "CLAUDE_CONFIG_DIR") found) keeps-logs?)))))
+
+(defn- log-files (config-dir)
+  ;; every session log of every project under one account, with its stat
+  (let (projects (path/join config-dir "projects"))
+    (mapcat (or (file/ls projects) [])
+      (fn (project)
+        (let (dir (path/join projects project))
+          (for (name (or (file/ls dir) []) :when (string/ends-with? name ".jsonl") :into [])
+            (let (file (path/join dir name))
+              {:file file :id (path/stem name) :config-dir config-dir :stat (file/stat file)})))))))
+
+;; ---- what a log says about its session, from its tail ------------------------------------------
+;; The CLI writes a few short bookkeeping lines after every turn — `ai-title` (the name it gave
+;; the session) and `last-prompt` — and every message carries the session's `cwd`, so the last
+;; few hundred kilobytes say all a list needs. A message line can be large (a file a tool read),
+;; so the tail is searched as text and only the short lines are decoded.
+
+(def- tail-bytes 262144)
+
+(defn- decoded (line)
+  (check-allow :discarded-catch (try (json/decode line) (catch _ nil))))
+
+(defn- string-field (line field)
+  ;; the value of the string `field` in a JSON `line`, read without decoding the whole line
+  (let (found (regex/find line (str "\"" field "\":\"((?:[^\"\\\\]|\\\\.)*)\"")))
+    (if (map? found)
+      (let (value (decoded (str "\"" (:text (first (:groups found))) "\"")))
+        (if (string? value) value nil))
+      nil)))
+
+(defn- message-line? (line)
+  ;; a message the person, the model or a tool wrote (a nested block is never `"type":"user"`)
+  (or (includes? line "\"type\":\"user\"") (includes? line "\"type\":\"assistant\"")))
+
+(defn- sidechain? (line)
+  (includes? line "\"isSidechain\":true"))
+
+(defn- turn-over? (line)
+  ;; whether a message line ends a turn: the model's own end, or the person interrupting it
+  (or (and (includes? line "\"type\":\"assistant\"")
+        (includes? line "\"stop_reason\":\"end_turn\""))
+    (includes? line "[Request interrupted by user")))
+
+(defn- summary-step (summary line)
+  (cond
+    (includes? line "\"type\":\"ai-title\"")
+      (assoc summary :title (or (string-field line "aiTitle") (:title summary)))
+    (includes? line "\"type\":\"last-prompt\"")
+      (assoc summary :prompt (or (string-field line "lastPrompt") (:prompt summary)))
+    (and (message-line? line) (not (sidechain? line)))
+      (assoc summary
+        :cwd (or (string-field line "cwd") (:cwd summary))
+        :turn-over? (turn-over? line))
+    else summary))
+
+(defn log-summary (file)
+  "What the log at `file` says about its session, read from its last few hundred kilobytes:
+`{:title :prompt :cwd :turn-over?}` — the name Claude gave it, the last thing the person asked,
+the directory it runs in, and whether its last message ended a turn. nil when there is no log."
+  (let (size (file/size file))
+    (if (nil? size)
+      nil
+      (let (start (math/max 0 (- size tail-bytes))
+            data (file/slurp-bytes-from file start)
+            lines (string/split (string/bytes-> (or data (string/->bytes "")) :lossy) "\n")
+            whole (if (> start 0) (rest lines) lines))
+        (fold whole {:title nil :prompt nil :cwd nil :turn-over? true} summary-step)))))
+
+;; How long after its last write a session that is mid-turn still counts as working: a tool can
+;; run for minutes without a line logged, but a session killed mid-turn never logs its end.
+(def- working-ms (* 15 60 1000))
+
+(defn sessions (&optional (opts {}))
+  "The Claude Code sessions whose logs changed in the last `:within` ms (default a day), under
+every account in `:config-dirs` (default `config-dirs`), newest first. Each is `{:id :file
+:config-dir :cwd :title :prompt :at :size :working?}`: `:at` the log's last write in epoch ms,
+`:working?` whether it is mid-turn."
+  (let (now (or (:now opts) (os/now))
+        within (or (:within opts) (* 24 60 60 1000))
+        recent (seq/filter (mapcat (or (:config-dirs opts) (config-dirs)) log-files)
+                 (fn (entry)
+                   (let (at (:mtime (:stat entry)))
+                     (and (int? at) (<= (- now at) within)))))
+        newest (reverse (seq/sort-by recent (fn (entry) (:mtime (:stat entry))))))
+    (vec (seq/keep newest
+           (fn (entry)
+             (let (summary (log-summary (:file entry))
+                   at (:mtime (:stat entry)))
+               (if (nil? summary)
+                 nil
+                 {:id (:id entry)
+                  :file (:file entry)
+                  :config-dir (:config-dir entry)
+                  :cwd (:cwd summary)
+                  :title (or (:title summary) (:prompt summary) (:id entry))
+                  :prompt (:prompt summary)
+                  :at at
+                  :size (:size (:stat entry))
+                  :working? (and (not (:turn-over? summary)) (< (- now at) working-ms))})))))))
+
+;; ---- reading what a log gained -----------------------------------------------------------------
+
+(defn- interrupted? (entry)
+  (let (content (map/get-in entry [:message :content]))
+    (and (= (:type entry) "user")
+      (vector? content)
+      (any? content
+        (fn (part)
+          (and (= (:type part) "text")
+            (string/starts-with? (or (:text part) "") "[Request interrupted by user")))))))
+
+(defn line-events (entry)
+  "The events of the shared vocabulary one decoded log line stands for, as a follower sees them:
+a message's own (`agentkit/claude-code/entry-events`), `:turn-done` where the model ended its
+turn or the person interrupted it, `:title` where Claude named the session. A subagent's lines
+are its own conversation, left out.
+
+    (agentkit/claude-log/line-events {:type \"ai-title\" :aiTitle \"Fix the tests\"})   ;=> [[:title \"Fix the tests\"]]
+    (agentkit/claude-log/line-events {:type \"assistant\" :message {:stop_reason \"end_turn\" :content [{:type \"text\" :text \"Done.\"}]}})   ;=> [[:text \"Done.\"] [:turn-done {:stop \"end_turn\"}]]"
+  (cond
+    (:isSidechain entry) []
+    (= (:type entry) "ai-title") (if (string? (:aiTitle entry)) [[:title (:aiTitle entry)]] [])
+    (interrupted? entry) [[:turn-done {:stop "interrupted"}]]
+    (and (= (:type entry) "assistant") (= (map/get-in entry [:message :stop_reason]) "end_turn"))
+      (conj (entry-events entry) [:turn-done {:stop "end_turn"}])
+    else (entry-events entry)))
+
+(defn text-events (text)
+  "The events of every whole line in `text`, a piece of a session log.
+
+    (agentkit/claude-log/text-events \"{\\\"type\\\":\\\"ai-title\\\",\\\"aiTitle\\\":\\\"A\\\"}\\nnot json\\n\")   ;=> [[:title \"A\"]]"
+  (vec (mapcat (seq/filter (map (string/split text "\n") decoded) map?) line-events)))
+
+(defn- last-newline (data)
+  ;; the index of the last newline byte in `data`, or -1
+  (letrec (back (fn (index)
+                  (cond
+                    (< index 0) -1
+                    (= (bytes/at data index) 10) index
+                    else (back (dec index)))))
+    (back (dec (count data)))))
+
+(defn cursor (file &optional (offset 0))
+  "A place in the log at `file` to read on from: `{:file :offset}`.
+
+    (agentkit/claude-log/cursor \"/c/s.jsonl\")   ;=> {:file \"/c/s.jsonl\" :offset 0}"
+  {:file file :offset offset})
+
+(defn read-new (at)
+  "What the log at cursor `at` gained since its offset: `{:events :cursor :reset?}`, the events
+of every line written whole since, and the cursor after them. A half-written last line is left
+for the next read. A log shorter than the offset was replaced: it is read again from its start,
+and `:reset?` says so. A missing log reads nothing."
+  (let (file (:file at)
+        offset (:offset at)
+        size (file/size file))
+    (cond
+      (nil? size) {:events [] :cursor at :reset? false}
+      (< size offset) (assoc (read-new (cursor file 0)) :reset? true)
+      (= size offset) {:events [] :cursor at :reset? false}
+      else
+        (let (data (or (file/slurp-bytes-from file offset) (string/->bytes ""))
+              newline (last-newline data))
+          (if (< newline 0)
+            {:events [] :cursor at :reset? false}
+            {:events (text-events (string/bytes-> (bytes/slice data 0 (inc newline)) :lossy))
+             :cursor (cursor file (+ offset newline 1))
+             :reset? false})))))
+
+;; ---- following a log ---------------------------------------------------------------------------
+
+(defn- follow-loop (at subscriber subscriber-ref interval)
+  (let (read (read-new at))
+    (when (or (not (empty? (:events read))) (:reset? read))
+      (send subscriber [:agent-log (self) {:events (:events read) :reset? (:reset? read)}]))
+    (receive
+      ([:down ^subscriber-ref _ _] :done)
+      ([:stop] :done)
+      (after interval (follow-loop (:cursor read) subscriber subscriber-ref interval)))))
+
+(defn follow (file subscriber &optional (opts {}))
+  "Start a process that follows the session log at `file` for `subscriber` and answer its pid:
+everything already in the log first (from `:offset`, default 0), then whatever is appended,
+each read sent as `[:agent-log follower {:events :reset?}]` (see `read-new`). It looks every
+`:interval` ms (default 500) and stops when sent `[:stop]` or when `subscriber` exits."
+  (let (interval (or (:interval opts) 500)
+        offset (or (:offset opts) 0))
+    (spawn (follow-loop (cursor file offset) subscriber (monitor subscriber) interval))))

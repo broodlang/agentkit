@@ -14,6 +14,7 @@ the worker that sent it. The kinds:
 - `:tool-use` — the model called a tool: `{:id :name :input}`
 - `:tool-result` — that call's answer as the model saw it: `{:id :output :error?}`
 - `:turn-done` — the turn ended: `{:text :usage :context :api-value :session :stop}`
+- `:title` — the name the backend gave the session (a string): a followed log reports it
 - `:limits` — how much of a plan's windows is used: `{window {:used :resets-at :status}}`
 - `:error` — the turn failed; the session may go on (a string)
 - `:refused` — the session was not started, and why (a string): the subscription check
@@ -30,8 +31,8 @@ the worker that sent it. The kinds:
 
 (def kinds
   #{:ready
-    :prompt :text-delta :text :thinking :tool-use :tool-result :turn-done :limits :error :refused
-    :exited})
+    :prompt :text-delta :text :thinking :tool-use :tool-result :turn-done :title :limits :error
+    :refused :exited})
 
 (defn event? (message)
   "Whether `message` is an event of this vocabulary.
